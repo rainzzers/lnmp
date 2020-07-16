@@ -1,0 +1,747 @@
+#!/bin/bash
+PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:~/bin
+export PATH
+
+#保证是在根用户下运行
+rootness(){
+	# Make sure only root can run our script
+	if [[ $EUID -ne 0 ]]; then
+		echo "This script must be run as root" 1>&2
+		exit 1
+	fi
+}
+
+#判断路径输入是否合法
+filter_location(){
+	local location=$1
+	if ! echo $location | grep -q "^/";then
+		while true
+		do
+			read -p "input error,please input location again." location
+			echo $location | grep -q "^/" && echo $location && break
+		done
+	else
+		echo $location
+	fi
+}
+
+yes_or_no(){
+	local prompt=$1
+	local yaction=$2
+	local naction=$3
+	while true; do
+		read -p "${prompt}?[Y/n]: " yn
+		yn=`upcase_to_lowcase $yn`
+		case $yn in
+			y ) eval "$yaction";break;;
+			n ) eval "$naction";break;;
+			* ) echo "input error,please only input y or n."
+		esac
+	done
+}
+
+vhost(){
+	local action=$1
+	case $action in
+		add ) vhost_add;;
+		list ) vhost_list;;
+		del ) vhost_del;;
+		*) echo "action $action not found";exit 1;;
+	esac	
+}
+
+vhost_add(){
+	if [ "$stack" == "lnmp" ];then
+		nginx_vhost_add
+	elif [ "$stack" == "lamp" ];then
+		apache_vhost_add
+	elif [ "$stack" == "lnamp" ];then
+		lnamp_vhost_add
+	else
+		echo "stack variable not found,exit."
+		exit 1
+	fi	
+}
+
+vhost_del(){
+	if [ "$stack" == "lnmp" ];then
+		nginx_vhost_del
+	elif [ "$stack" == "lamp" ];then
+		apache_vhost_del
+	elif [ "$stack" == "lnamp" ];then
+		lnamp_vhost_del
+	else
+		echo "stack variable not found,exit."
+		exit 1
+	fi	
+}
+
+vhost_list(){
+	if [ "$stack" == "lnmp" ];then
+		nginx_vhost_list
+	elif [ "$stack" == "lamp" ];then
+		apache_vhost_list
+	elif [ "$stack" == "lnamp" ];then
+		lnamp_vhost_list
+	else
+		echo "stack variable not found,exit."
+		exit 1
+	fi	
+}
+
+lnamp_vhost_list(){
+	sed -n -r -e 's/ServerAlias\s+(.*)/\1/p' -e 's/DocumentRoot\s+(.*)/\1/p'  ${apache_location}/conf/vhost/*.conf | awk 'BEGIN{printf ("%-50s %-50s\n%-50s %-50s\n","server_name","root","-----------","----")}{printf("%-50s",$0);getline;printf $0"\n" }'
+}
+
+lnamp_vhost_del(){
+	read -p "input server_name of vhost you'll delete(ie.www.centos.bz): " domain
+	#删除nginx配置
+	if vhost_is_exist "$domain";then
+		rm -f ${nginx_location}/conf/vhost/$domain.conf
+		echo "complete deleted the server_name ${domain} of vhost."
+		echo "reloading the nginx config file..."
+		if ${nginx_location}/sbin/nginx -t;then
+			${nginx_location}/sbin/nginx -s reload
+			echo "reload success."
+		else
+		 	echo "reload failed.config file had an error,please fix it."
+		 	exit 1
+		fi
+	else
+		echo "vhost $domain not found,failed to delete."
+		exit 1
+	fi
+
+	#删除apache配置
+	if ! apache_vhost_is_exist "$domain";then
+		echo "vhost $domain not found"
+		exit 1
+	else
+		rm -f ${apache_location}/conf/vhost/$domain.conf	
+		echo "complete deleted the server_name ${domain} of vhost."
+		#重载配置
+		echo "reloading the apache config file..."
+		if ${apache_location}/bin/apachectl -t;then
+			/etc/init.d/httpd restart
+			echo "reload success."
+		else
+		 	echo "reload failed.config file had an error,please fix it."
+		 	exit 1
+		fi
+	fi	
+}
+
+lnamp_vhost_add(){
+	set_apache_allow_syntax
+
+	#输入域名
+	while true; do
+		read -p "input server names(ie.www.centos.bz centos.bz): " server_names
+		for i in $server_names;do
+			if vhost_is_exist $i;then
+				echo "vhost $i is exist,please reinput server_names."
+				break
+			fi
+			break 2
+		done	
+	done
+
+	#设置默认网站目录
+	default_root="/home/${server_names%% *}"
+	#输入网站目录
+	read -p "input website root(default:$default_root): " website_root
+	website_root=${website_root:=$default_root}
+
+	#创建目录
+	mkdir -p ${website_root}/ /home/wwwlog/${server_names%% *}
+	chown -R www ${website_root}
+
+	#写入nginx配置
+	cat > ${nginx_location}/conf/vhost/${server_names%% *}.conf << EOF
+	server {
+		server_name ${server_names};
+		listen 80;
+		index index.php index.html index.htm;
+		root ${website_root};
+
+	    location / {
+	    	try_files $uri $uri/index.html @apache;
+	    }        
+
+	    location @apache {
+	        internal;
+	        proxy_pass http://127.0.0.1:88;
+	        include proxy.conf;
+	    }
+
+	    location ~ .*\.(php|php5)?$ {
+	            proxy_pass http://127.0.0.1:88;
+	            include proxy.conf;
+	    }	
+
+		location ~ .*\.(gif|jpg|jpeg|png|bmp|swf)$ {
+				expires      30d;
+		}
+
+		location ~ .*\.(js|css)?$ {
+				expires      12h;
+		}
+
+		access_log  /home/wwwlog/${server_names%% *}/access_nginx.log access;
+		error_log  /home/wwwlog/${server_names%% *}/error_nginx.log error;
+	}
+EOF
+
+	#写入apache配置
+	cat > ${apache_location}/conf/vhost/${server_names%% *}.conf << EOF
+	<VirtualHost 127.0.0.1:88>
+	ServerName ${server_names%% *}
+	ServerAlias ${server_names}
+	DocumentRoot ${website_root}
+	DirectoryIndex index.php index.html index.htm
+	<Directory ${website_root}>
+	Options +Includes -Indexes
+	AllowOverride All
+	Order Deny,Allow
+	${allow_from_all}
+	php_admin_value open_basedir ${website_root}:/tmp:/proc
+	</Directory>
+	ErrorLog  /home/wwwlog/${server_names%% *}/error_apache.log
+	TransferLog  /home/wwwlog/${server_names%% *}/access_apache.log
+	</VirtualHost>
+EOF
+
+	#重载配置
+	echo "reloading the apache config file..."
+	if ${apache_location}/bin/apachectl -t;then
+		/etc/init.d/httpd restart
+		echo "reload success."
+	else
+	 	echo "reload failed.config file had an error,please fix it."
+	 	exit 1
+	fi
+
+	echo "reloading the nginx config file..."
+	if ${nginx_location}/sbin/nginx -t;then
+		${nginx_location}/sbin/nginx -s reload
+		echo "reload success."
+	else
+	 	echo "reload failed.config file had an error,please fix it."
+	 	exit 1
+	fi
+
+	echo "congratulations.vhost ${server_names%% *} had created."
+	echo "website root is ${website_root}/."
+
+}
+
+nginx_vhost(){
+	local action=$1
+	case $action in
+		add ) nginx_vhost_add;;
+		list ) nginx_vhost_list;;
+		del ) nginx_vhost_del;;
+		*) echo "action $action not found";exit 1;;
+	esac
+}
+
+php_support_without_pathinfo(){
+	php_support_code="location ~ \.php$ {
+			fastcgi_pass   127.0.0.1:9000;
+			fastcgi_index  index.php;
+			fastcgi_param  SCRIPT_FILENAME  \$document_root\$fastcgi_script_name;
+			fastcgi_param  PHP_VALUE         open_basedir=\$document_root:/tmp/:/proc/;
+			include        fastcgi_params;
+	}"
+	
+}
+
+php_support_with_pathinfo(){
+	php_support_code="location ~ \.php($|/){
+            fastcgi_pass   127.0.0.1:9000;
+            fastcgi_index  index.php;
+            include        fastcgi_params;
+            set \$path_info \"\";
+            set \$real_script_name \$fastcgi_script_name;
+            if (\$fastcgi_script_name ~ \"^(.+?\.php)(/.+)$\") {
+                set \$real_script_name \$1;
+                set \$path_info \$2;
+            }
+            fastcgi_param SCRIPT_FILENAME \$document_root\$real_script_name;
+            fastcgi_param SCRIPT_NAME \$real_script_name;
+            fastcgi_param PATH_INFO \$path_info;
+			fastcgi_param  PHP_VALUE         open_basedir=\$document_root:/tmp/:/proc/;
+    }"
+}
+
+enable_php(){
+	yes_or_no "enable PATH_INFO support" "php_support_with_pathinfo" "php_support_without_pathinfo"
+}
+
+nginx_vhost_add(){
+	#输入域名
+	while true; do
+		read -p "input server names(ie.www.centos.bz centos.bz): " server_names
+		for i in $server_names;do
+			if vhost_is_exist $i;then
+				echo "vhost $i is exist,please reinput server_names."
+				break
+			fi
+			break 2
+		done	
+	done
+	#设置默认网站目录
+	default_root="/home/${server_names%% *}"
+	#输入网站目录
+	read -p "input website root(default:$default_root): " website_root
+	website_root=${website_root:=$default_root}
+	#是否添加重写规则
+	yes_or_no "add nginx rewrite rule" "select_rewrite_rule" "rewrite_rule=''"
+
+	#是否支持php
+	yes_or_no "enable php support" "enable_php" "php_support_code=''"
+
+	cat > ${nginx_location}/conf/vhost/${server_names%% *}.conf << EOF
+	server {
+		server_name ${server_names};
+		listen 80;
+		index index.php index.html index.htm;
+		root ${website_root};
+		${rewrite_rule}
+		${php_support_code}
+		location ~ .*\.(gif|jpg|jpeg|png|bmp|swf)$ {
+				expires      30d;
+		}
+
+		location ~ .*\.(js|css)?$ {
+				expires      12h;
+		}
+
+		access_log  /home/wwwlog/${server_names%% *}/access.log access;
+		error_log  /home/wwwlog/${server_names%% *}/error.log error;
+	}
+EOF
+
+	echo "congratulations.vhost ${server_names%% *} had created."
+	echo "website root is ${website_root}/."
+	#创建目录
+	mkdir -p /home/wwwlog/${server_names%% *} ${website_root}
+	chown -R www ${website_root}
+	#重载配置
+	echo "reloading the nginx config file..."
+	if ${nginx_location}/sbin/nginx -t;then
+		${nginx_location}/sbin/nginx -s reload
+		echo "reload success."
+	else
+	 	echo "reload failed.config file had an error,please fix it."
+	 	exit 1
+	fi
+}
+
+nginx_vhost_list(){
+	sed -n -r -e 's/server_name\s+(.*);/\1/p' -e 's/root\s+(.*);/\1/p'  ${nginx_location}/conf/vhost/*.conf | awk 'BEGIN{printf ("%-50s %-50s\n%-50s %-50s\n","server_name","root","-----------","----")}{printf("%-50s",$0);getline;printf $0"\n" }'
+}
+
+nginx_vhost_del(){
+	read -p "input server_name of vhost you'll delete(ie.www.centos.bz): " domain
+	if vhost_is_exist "$domain";then
+		rm -f ${nginx_location}/conf/vhost/$domain.conf
+		echo "complete deleted the server_name ${domain} of vhost."
+		echo "reloading the nginx config file..."
+		if ${nginx_location}/sbin/nginx -t;then
+			${nginx_location}/sbin/nginx -s reload
+			echo "reload success."
+		else
+		 	echo "reload failed.config file had an error,please fix it."
+		 	exit 1
+		fi
+	else
+		echo "vhost $domain not found,failed to delete."
+		exit 1
+	fi	
+}
+
+apache_vhost(){
+	local action=$1
+	case $action in
+		add ) apache_vhost_add;;
+		list ) apache_vhost_list;;
+		del ) apache_vhost_del;;
+		*) echo "action $action not found";exit 1;;
+	esac
+}
+
+set_apache_allow_syntax(){
+	if [[ $apache_location == "" ]]; then
+		while true; do
+			read -p "sorry,can not figure out the apache location,please input(default:/usr/local/apache): " apache_location
+			apache_location=${apache_location:=/usr/local/apache}
+			apache_location=`filter_location "$apache_location"`
+
+			#判断版本
+			if ${apache_location}/bin/httpd -v | grep -q "Apache/2.4"; then
+				allow_from_all="Require all granted"
+				break
+			elif ${apache_location}/bin/httpd -v | grep -q "Apache/2.2"; then
+				allow_from_all="Allow from All"
+				break
+			else
+				echo "can not get apache version,may be the "
+			fi		
+		done
+	else
+		#判断版本
+		if ${apache_location}/bin/httpd -v | grep -q "Apache/2.4"; then
+			allow_from_all="Require all granted"	
+		elif ${apache_location}/bin/httpd -v | grep -q "Apache/2.2"; then
+			allow_from_all="Allow from All"
+		else
+			while true; do
+				read -p "sorry,can not figure out the apache location,please input(default:/usr/local/apache): " apache_location
+				apache_location=${apache_location:=/usr/local/apache}
+				apache_location=`filter_location "$apache_location"`
+
+				#判断版本
+				if ${apache_location}/bin/httpd -v | grep -q "Apache/2.4"; then
+					allow_from_all="Require all granted"
+					break
+				elif ${apache_location}/bin/httpd -v | grep -q "Apache/2.2"; then
+					allow_from_all="Allow from All"
+					break
+				else
+					echo "can not get apache version,may be the "
+				fi		
+			done
+		fi		
+	fi		
+}
+
+apache_vhost_add(){
+	set_apache_allow_syntax
+
+	#输入域名
+	while true; do
+		read -p "input server names(ie.www.centos.bz centos.bz): " server_names
+		for i in $server_names;do
+			if apache_vhost_is_exist $i;then
+				echo "vhost $i is exist,please reinput server_names."
+				break
+			fi
+			break 2
+		done	
+	done
+	#设置默认网站目录
+	default_root="/home/${server_names%% *}"
+	#输入网站目录
+	read -p "input website root(default:$default_root): " website_root
+	website_root=${website_root:=$default_root}
+	#开始写入配置文件
+	cat > ${apache_location}/conf/vhost/${server_names%% *}.conf << EOF
+	<VirtualHost *:80>
+	ServerName ${server_names%% *}
+	ServerAlias ${server_names}
+	DocumentRoot ${website_root}
+	DirectoryIndex index.php index.html index.htm
+	<Directory ${website_root}>
+	Options +Includes -Indexes
+	AllowOverride All
+	Order Deny,Allow
+	${allow_from_all}
+	php_admin_value open_basedir ${website_root}:/tmp:/proc
+	</Directory>
+	ErrorLog  /home/wwwlog/${server_names%% *}/error.log
+	TransferLog  /home/wwwlog/${server_names%% *}/access.log
+	</VirtualHost>
+EOF
+	echo "congratulations.vhost ${server_names%% *} had created."
+	echo "website root is ${website_root}/."
+	#创建目录
+	mkdir -p /home/wwwlog/${server_names%% *} ${website_root}
+	chown -R www ${website_root}
+	#重载配置
+	echo "reloading the apache config file..."
+	if ${apache_location}/bin/apachectl -t;then
+		/etc/init.d/httpd restart
+		echo "reload success."
+	else
+	 	echo "reload failed.config file had an error,please fix it."
+	 	exit 1
+	fi
+}
+
+apache_vhost_list(){
+	sed -n -r -e 's/ServerAlias\s+(.*)/\1/p' -e 's/DocumentRoot\s+(.*)/\1/p'  ${apache_location}/conf/vhost/*.conf | awk 'BEGIN{printf ("%-50s %-50s\n%-50s %-50s\n","server_name","root","-----------","----")}{printf("%-50s",$0);getline;printf $0"\n" }'
+}
+
+apache_vhost_del(){
+	read -p "input server_name of vhost you'll delete(ie.www.centos.bz): " domain
+	if ! apache_vhost_is_exist "$domain";then
+		echo "vhost $domain not found"
+		exit 1
+	else
+		rm -f ${apache_location}/conf/vhost/$domain.conf	
+		echo "complete deleted the server_name ${domain} of vhost."
+		#重载配置
+		echo "reloading the apache config file..."
+		if ${apache_location}/bin/apachectl -t;then
+			/etc/init.d/httpd restart
+			echo "reload success."
+		else
+		 	echo "reload failed.config file had an error,please fix it."
+		 	exit 1
+		fi
+	fi	
+}
+
+#判断root密码是否正确
+check_root_passwd(){
+	while true
+	do
+		read -p "please input your mysql root password: " root_password
+		echo "show databases" | ${mysql_location}/bin/mysql -uroot -p${root_password} > /tmp/mysql_err 2>&1
+		if [ $? != 0 ];then
+			grep -q "1045" /tmp/mysql_err && echo "your root password is not correct"
+		else
+			break
+		fi	
+	done	
+}
+
+mysql_manger(){
+	local action=$1
+	case $action in
+		add ) mysql_add;;
+		mod ) mysql_user_mod;;
+		del ) mysql_del;;
+		reset ) mysql_reset;;
+		*) echo "action $action not found";exit 1
+	esac	
+
+}
+
+mysql_add_db(){
+	read -p "please input the database name: " dbname
+	echo "create database ${dbname};" | ${mysql_location}/bin/mysql -uroot -p${root_password} > /dev/null 2>&1 && echo "successfully create database ${dbname}" || echo "create database ${dbname} failed."
+}
+
+mysql_add_user(){
+	read -p "please input the user name: " user
+	read -p "please input the user password: " passwd
+    read -p "input the database you'll grant privileges on to this user,input \"*\" means grant all databases.(default:all databases.): " grantdb
+    grantdb=${grantdb:=*}
+    read -p "input the client you'll allow access to this user,input \"%\" means allow all client.(default:localhost 127.0.0.1): " grantclient
+    grantclient=${grantclient:="localhost 127.0.0.1"}
+    for client in $grantclient; do
+    	echo "GRANT ALL PRIVILEGES ON ${grantdb}.* TO '${user}'@'$client' IDENTIFIED BY '$passwd'" | ${mysql_location}/bin/mysql -uroot -p${root_password} > /dev/null 2>&1
+	done
+	echo  "flush privileges;" | ${mysql_location}/bin/mysql -uroot -p${root_password} > /dev/null 2>&1
+	echo "successfully add user ${user}"
+}
+
+mysql_add(){
+	check_root_passwd
+	#是否添加数据库
+	yes_or_no "add a database" "mysql_add_db"
+	#是否添加用户
+	yes_or_no "add a user" "mysql_add_user"
+}
+
+mysql_del_db(){
+	read -p "please input the database name: " $db
+	echo "drop database $db;" | ${mysql_location}/bin/mysql -uroot -p${root_password} > /dev/null 2>&1
+	echo "successfully delete database $db."
+}
+
+mysql_del_user(){
+	read -p "please input the user name: " user
+	echo "use mysql;delete from user where User='$user' " | ${mysql_location}/bin/mysql -uroot -p${root_password} > /dev/null 2>&1
+	echo "successfully delete user $user."
+}
+
+mysql_user_mod(){
+	check_root_passwd
+	read -p "please input the user: " user
+	read -p "please input a new password: " passwd
+	echo "use mysql;update user set password=PASSWORD('$passwd') where User='$user';flush privileges;" | ${mysql_location}/bin/mysql -uroot -p${root_password} > /dev/null 2>&1
+	echo "successfully modify user $user password."
+}
+
+mysql_del(){
+	check_root_passwd
+	yes_or_no "delete a database" "mysql_del_db"
+	yes_or_no "delete a user" "mysql_del_user"
+}
+
+mysql_reset(){
+	read -p "please input a new password for root user: " password
+	/etc/init.d/mysqld stop 2>&1 >/dev/null
+	if [ "$mysql_location" == "" ];then
+		read -p "mysql location not found,input mysql location(ie./usr/local/mysql): " mysql_location
+	fi	
+	${mysql_location}/bin/mysqld_safe  --defaults-file=${mysql_location}/etc/my.cnf --skip-grant-tables 2>&1 >/dev/null &
+	echo "wait for 8 seconds..."
+	sleep 8 && ${mysql_location}/bin/mysql -u root -e "use mysql;update user set password=PASSWORD(\"${password}\") where User='root';flush privileges;" 
+	/etc/init.d/mysqld restart 2>&1 >/dev/null
+	echo  "show databases;" | ${mysql_location}/bin/mysql -uroot -p${password}  > /dev/null 2>&1 && echo "successfully reset your mysql root password" || echo "Sorry,failed to reset your root password."
+
+}
+
+ftp_user(){
+	if [[ "$pureftpd_location" == "" ]]; then
+		echo "pureftpd not found,please install pureftpd first."
+		exit 1
+	fi
+	
+	local action=$1
+	case $action in
+		add ) ftp_user_add;;
+		list ) ftp_user_list;;
+		del ) ftp_user_del;;
+		mod ) ftp_user_mod;;
+		*) echo "action $action not found";exit 1;;
+	esac	
+
+}
+
+ftp_user_add(){
+	if [[ $user_manager_pureftpd == true ]]; then
+		echo "you had installed pure-ftpd with mysql.you should add ftp user with user manager panel."
+		exit 1
+	else
+		read -p "input ftp user name: " ftp_username
+		read -p "input ftp user $ftp_username Home Directory: " ftp_home
+		while true;do
+			read -p "input system user name(ie. www): " sys_username
+			user_id=`id $sys_username | sed -r 's/uid=([0-9]+).*/\1/'`
+			if [[ "$user_id" == "" ]]; then
+				echo "user $sys_username not found,please input an exsit system user."
+				continue
+			fi
+
+			if [[ "$user_id" == "0" ]]; then
+				echo "the system user $sys_username has root privilege,please input a non root privilege user."
+				continue
+			fi
+			break
+		done
+		${pureftpd_location}/bin/pure-pw useradd $ftp_username -u $sys_username -d $ftp_home
+		${pureftpd_location}/bin/pure-pw mkdb
+		echo "successfully add ftp user $ftp_username."
+	fi	
+}
+
+ftp_user_list(){
+	printf "FTPUser\t\tRoot Directory\n"
+	${pureftpd_location}/bin/pure-pw list
+}
+
+ftp_user_del(){
+	read -p "(Please input the ftpuser you'll delete):" ftpuser
+	${pureftpd_location}/bin/pure-pw userdel $ftpuser
+	${pureftpd_location}/bin/pure-pw mkdb
+	echo "successfully delete ftpuser $ftpuser"
+}
+
+ftp_user_mod(){	
+	read -p "(Please input the ftpuser you'll modify): " ftpuser
+	echo "1. modify ftpuser $ftpuser password"
+	echo "2. modify ftpuser $ftpuser home directory"
+	echo "3. modify ftpuser $ftpuser system user name"
+	while true; do
+		read -p "please input a number: " ftp_mod
+		case $ftp_mod in
+			1 ) ${pureftpd_location}/bin/pure-pw passwd $ftpuser;echo "change ftp user $ftpuser password successfully.";break;;
+			2 )	read -p "please enter ftpuser $ftpuser new home directory: " ftp_home;${pureftpd_location}/bin/pure-pw usermod $ftpuser -d $ftp_home;break;;
+			3 )	read -p "please enter ftpuser $ftpuser system user name: " sys_username;${pureftpd_location}/bin/pure-pw usermod $ftpuser -u $sys_username;break;;
+			* ) echo "input error.";;
+		esac
+	done
+	${pureftpd_location}/bin/pure-pw mkdb
+}
+
+#检查vhost是否存在
+vhost_is_exist(){
+	local domain=$1
+	local conf_file="${nginx_location}/conf/vhost/$1.conf"
+	if [ -f "$conf_file" ];then
+		return 0
+	else
+		return 1
+	fi	
+}
+
+#检查apahcevhost是否存在
+apache_vhost_is_exist(){
+	local domain=$1
+	local conf_file="${apache_location}/conf/vhost/$1.conf"
+	if [ -f "$conf_file" ];then
+		return 0
+	else
+		return 1
+	fi	
+}
+
+#大写转换成小写
+upcase_to_lowcase(){
+	words=$1
+	echo $words | tr '[A-Z]' '[a-z]'
+}
+
+#nginx重写规则选择
+select_rewrite_rule(){
+	local rewrite_rules=( "include rewrite/wordpress.conf;" "include rewrite/DEDECMS.conf;" "include rewrite/Discuz_7.conf;" "include rewrite/Discuz_X.conf;" "include rewrite/ecshop.conf;" "include rewrite/phpcms.conf;"  "include rewrite/PHPWind.conf;"  "include rewrite/shopex.conf;"  "include rewrite/Typecho.conf;"    )
+	echo "available nginx rewrite rules:"
+	echo -e "1. Custom\n2. WordPress\n3. DEDECMS\n4. Discuz_7\n5. Discuz_X\n6. ECshop\n7. PHPCMS\n8. PHPWind\n9. Shopex\n10. Typecho"
+	while true; do
+		read -p "please input a number: " rule
+		case "$rule" in
+			1|2|3|4|5|6|7|8|9|10) break;;
+			*) echo "input error.";;
+		esac
+	done
+
+	if [[ "$rule" == "1" ]];then
+		while true;do
+			read -p "please input your rewrite rule name: " rule_name
+			if [[ -f ${nginx_location}/conf/rewrite/${rule_name}.conf ]];then
+				echo "${rule_name}.conf file exists,please reinput"
+			else
+				touch ${nginx_location}/conf/rewrite/${rule_name}.conf
+				echo "file ${nginx_location}/conf/rewrite/${rule_name}.conf have created,please input your rewrite rule to this file."
+				rewrite_rule="include rewrite/${rule_name}.conf;"
+				break
+			fi	
+		done
+	else	
+		rewrite_rule=${rewrite_rules[$rule-2]}
+	fi
+	
+}
+
+#程序从这里开始
+rootness
+if [ $# != 2 ];then
+	echo "Usage: ez program_name action"
+	exit 1
+fi
+
+#引入各软件安装路径
+if [[ -s /etc/ezhttp_info_do_not_del ]]; then
+	. /etc/ezhttp_info_do_not_del
+else
+	echo "error,file /etc/ezhttp_info_do_not_del not found,ez command can not be executed."
+	exit 1
+fi	
+
+#接收脚本传参
+proname=$1
+action=$2
+
+case $proname in
+	vhost ) vhost $action;;
+	nginx ) echo "ez nginx $2 is not available,please use ez vhost $2";;
+	apache ) echo "ez apache $2 is not available,please use ez vhost $2";;
+	ftp ) ftp_user $action;;
+    mysql ) mysql_manger $action;;
+	*)  echo "program_name $proname not found.";exit 1;;
+esac
